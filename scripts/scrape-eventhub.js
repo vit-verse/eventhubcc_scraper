@@ -180,96 +180,42 @@ async function syncWithSupabase(scrapedEvents) {
   console.log('Syncing with Supabase...');
   
   try {
-    const cache = loadCache();
-    const cachedEvents = cache.events || [];
+    console.log('Deleting all existing events...');
+    const { error: deleteError } = await supabase
+      .from('official_events')
+      .delete()
+      .neq('id', '');
     
-    const cachedMap = new Map(cachedEvents.map(e => [e.id, e]));
-    const scrapedMap = new Map(scrapedEvents.map(e => [e.id, e]));
-    
-    const newEvents = [];
-    const updatedEvents = [];
-    const unchangedEvents = [];
-    
-    for (const event of scrapedEvents) {
-      const cached = cachedMap.get(event.id);
-      
-      if (!cached) {
-        newEvents.push(event);
-      } else {
-        const hasChanged = 
-          cached.title !== event.title ||
-          cached.event_date !== event.event_date ||
-          cached.venue !== event.venue ||
-          cached.category !== event.category ||
-          cached.entry_fee !== event.entry_fee ||
-          cached.team_size !== event.team_size;
-        
-        if (hasChanged) {
-          updatedEvents.push(event);
-        } else {
-          unchangedEvents.push(event);
-        }
-      }
+    if (deleteError) {
+      throw new Error(`Delete failed: ${deleteError.message}`);
     }
     
-    const deletedEventIds = [];
-    for (const cached of cachedEvents) {
-      if (!scrapedMap.has(cached.id)) {
-        deletedEventIds.push(cached.id);
-      }
+    console.log('All existing events deleted');
+    
+    scrapedEvents.sort((a, b) => {
+      const idA = a.id.split('_')[0];
+      const idB = b.id.split('_')[0];
+      return parseInt(idA) - parseInt(idB);
+    });
+    
+    console.log(`Inserting ${scrapedEvents.length} events in order...`);
+    const { error: insertError } = await supabase
+      .from('official_events')
+      .insert(scrapedEvents);
+    
+    if (insertError) {
+      throw new Error(`Insert failed: ${insertError.message}`);
     }
     
-    console.log('Changes detected:');
-    console.log(`  New events: ${newEvents.length}`);
-    console.log(`  Updated events: ${updatedEvents.length}`);
-    console.log(`  Deleted events: ${deletedEventIds.length}`);
-    console.log(`  Unchanged events: ${unchangedEvents.length}`);
-    
-    let totalChanges = 0;
-    
-    if (newEvents.length > 0 || updatedEvents.length > 0) {
-      const eventsToUpsert = [...newEvents, ...updatedEvents];
-      
-      console.log(`Upserting ${eventsToUpsert.length} events...`);
-      const { error } = await supabase
-        .from('official_events')
-        .upsert(eventsToUpsert, { onConflict: 'id' });
-      
-      if (error) {
-        throw new Error(`Upsert failed: ${error.message}`);
-      }
-      
-      console.log(`Upserted ${eventsToUpsert.length} events`);
-      totalChanges += eventsToUpsert.length;
-    }
-    
-    if (deletedEventIds.length > 0) {
-      console.log(`Marking ${deletedEventIds.length} events as inactive...`);
-      
-      const { error } = await supabase
-        .from('official_events')
-        .update({ is_active: false, updated_at: new Date().toISOString() })
-        .in('id', deletedEventIds);
-      
-      if (error) {
-        throw new Error(`Delete failed: ${error.message}`);
-      }
-      
-      console.log(`Marked ${deletedEventIds.length} events as inactive`);
-      totalChanges += deletedEventIds.length;
-    }
+    console.log(`Inserted ${scrapedEvents.length} events successfully`);
     
     saveCache(scrapedEvents);
     
-    console.log(`Sync completed! Total changes: ${totalChanges}`);
+    console.log('Sync completed!');
     
     return {
       success: true,
-      totalEvents: scrapedEvents.length,
-      newEvents: newEvents.length,
-      updatedEvents: updatedEvents.length,
-      deletedEvents: deletedEventIds.length,
-      unchangedEvents: unchangedEvents.length
+      totalEvents: scrapedEvents.length
     };
     
   } catch (error) {
@@ -301,10 +247,6 @@ async function main() {
     console.log('='.repeat(50));
     console.log(`Status: SUCCESS`);
     console.log(`Total Events: ${result.totalEvents}`);
-    console.log(`New: ${result.newEvents}`);
-    console.log(`Updated: ${result.updatedEvents}`);
-    console.log(`Deleted: ${result.deletedEvents}`);
-    console.log(`Unchanged: ${result.unchangedEvents}`);
     console.log(`Completed at: ${new Date().toISOString()}`);
     console.log('='.repeat(50));
     
