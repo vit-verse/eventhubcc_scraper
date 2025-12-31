@@ -142,6 +142,7 @@ async function scrapeEventHub() {
         }
         
         const uniqueKey = `${eventId}_${title}_${category}`;
+        const posterUrl = `https://eventhubcc.vit.ac.in/EventHub/image/?id=${eventId}`;
         
         if (!eventMap.has(uniqueKey)) {
           const event = {
@@ -153,7 +154,7 @@ async function scrapeEventHub() {
             participant_type: participantType,
             entry_fee: entryFee,
             team_size: teamSize,
-            poster_url: null,
+            poster_url: posterUrl,
             scraped_at: new Date().toISOString()
           };
           
@@ -174,6 +175,7 @@ async function scrapeEventHub() {
     throw error;
   }
 }
+
 async function syncWithSupabase(scrapedEvents) {
   console.log('Syncing with Supabase...');
   
