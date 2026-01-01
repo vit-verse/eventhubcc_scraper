@@ -4,6 +4,7 @@ import * as cheerio from 'cheerio';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import https from 'https';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,250 +17,191 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+/* -------------------- CACHE -------------------- */
+
 function loadCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
-      const data = fs.readFileSync(CACHE_FILE, 'utf8');
-      return JSON.parse(data);
+      return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
     }
-  } catch (error) {
-    console.error('Error loading cache:', error.message);
-  }
+  } catch {}
   return { events: [], lastScrape: null };
 }
 
 function saveCache(events) {
-  try {
-    const cacheDir = path.dirname(CACHE_FILE);
-    if (!fs.existsSync(cacheDir)) {
-      fs.mkdirSync(cacheDir, { recursive: true });
-    }
-    
-    const cacheData = {
-      events: events,
-      lastScrape: new Date().toISOString(),
-      totalEvents: events.length
-    };
-    
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2));
-    console.log('Cache saved successfully');
-  } catch (error) {
-    console.error('Error saving cache:', error.message);
-  }
+  const dir = path.dirname(CACHE_FILE);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  fs.writeFileSync(
+    CACHE_FILE,
+    JSON.stringify(
+      {
+        lastScrape: new Date().toISOString(),
+        totalEvents: events.length,
+        events
+      },
+      null,
+      2
+    )
+  );
 }
+
+/* -------------------- HELPERS -------------------- */
 
 function parseEventDate(dateStr) {
   try {
     return new Date(dateStr).toISOString();
-  } catch (error) {
-    console.error('Error parsing date:', dateStr);
+  } catch {
     return new Date().toISOString();
   }
 }
 
-async function scrapeEventHub() {
-  console.log('Starting EventHub scraper...');
-  console.log('Timestamp:', new Date().toISOString());
-  
-  try {
-    console.log('Fetching EventHub page...');
-    const response = await axios.get(EVENTHUB_URL, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      timeout: 30000,
-      httpsAgent: new (await import('https')).Agent({
-        rejectUnauthorized: false
-      })
-    });
-    
-    console.log(`Fetched HTML (${response.data.length} bytes)`);
-    
-    const $ = cheerio.load(response.data);
-    const eventCards = $('form #events .col-lg-4 .card');
-    
-    console.log(`Found ${eventCards.length} event cards`);
-    
-    if (eventCards.length === 0) {
-      throw new Error('No event cards found');
+function extractTeamSize($card, $) {
+  let teamSize = '1'; // default
+
+  $card.find('i').each((_, icon) => {
+    const cls = $(icon).attr('class') || '';
+
+    if (
+      cls.includes('fa-users') ||
+      cls.includes('fa-user') ||
+      cls.includes('fa-street-view') ||
+      cls.includes('fa-people')
+    ) {
+      const text = $(icon).parent().text();
+      const match = text.match(/\b\d+\s*-\s*\d+\b|\b\d+\b/);
+      if (match) {
+        teamSize = match[0].replace(/\s+/g, '');
+      }
     }
-    
-    const scrapedEvents = [];
-    const eventMap = new Map();
-    
-    eventCards.each((index, element) => {
-      try {
-        const $card = $(element);
-        
-        const eventId = $card.find('button[name="eid"]').attr('value');
-        if (!eventId || eventId === '0') {
-          return;
-        }
-        
-        const title = $card.find('.card-title span').first().text().trim();
-        if (!title) {
-          return;
-        }
-        
-        const dateSpan = $card.find('.fa-calendar-days').next('span');
-        const dateStr = dateSpan.text().trim();
-        
-        const venueSpan = $card.find('.fa-map-location-dot').next('span');
-        const venue = venueSpan.text().trim() || 'TBA';
-        
-        let category = 'General';
-        const categoryDiv = $card.find('div').filter((i, el) => {
-          const text = $(el).text().trim();
-          return text.startsWith('(') && text.endsWith(')');
-        }).first();
-        if (categoryDiv.length > 0) {
-          const categoryText = categoryDiv.find('span').text().trim();
-          if (categoryText) {
-            category = categoryText;
-          }
-        }
-        
-        const participantIcon = $card.find('.fa-user-check, .fa-people-carry-box');
-        let participantType = 'All';
-        if (participantIcon.length > 0) {
-          const participantSpan = participantIcon.next('span');
-          if (participantSpan.length > 0) {
-            participantType = participantSpan.text().trim();
-          }
-        }
-        
-        const feeSpan = $card.find('.fa-indian-rupee-sign').next('span');
-        const feeStr = feeSpan.text().trim();
-        const entryFee = parseInt(feeStr) || 0;
-        
-        const teamIcon = $card.find('.fa-street-view, .fa-users');
-        let teamSize = '1';
-        if (teamIcon.length > 0) {
-          const teamSpan = teamIcon.next('span');
-          if (teamSpan.length > 0) {
-            teamSize = teamSpan.text().trim();
-          }
-        }
-        
-        const uniqueKey = `${eventId}_${title}_${category}`;
-        const posterUrl = `https://eventhubcc.vit.ac.in/EventHub/image/?id=${eventId}`;
-        
-        if (!eventMap.has(uniqueKey)) {
-          const event = {
-            id: uniqueKey,
-            title: title,
-            event_date: parseEventDate(dateStr),
-            venue: venue,
-            category: category,
-            participant_type: participantType,
-            entry_fee: entryFee,
-            team_size: teamSize,
-            poster_url: posterUrl,
-            scraped_at: new Date().toISOString()
-          };
-          
-          eventMap.set(uniqueKey, event);
-          scrapedEvents.push(event);
-        }
-        
-      } catch (error) {
-        console.error(`Error parsing card ${index + 1}:`, error.message);
+  });
+
+  return teamSize;
+}
+
+/* -------------------- SCRAPER -------------------- */
+
+async function scrapeEventHub() {
+  console.log('Fetching EventHub...');
+
+  const response = await axios.get(EVENTHUB_URL, {
+    timeout: 30000,
+    headers: {
+      'User-Agent': 'Mozilla/5.0'
+    },
+    httpsAgent: new https.Agent({ rejectUnauthorized: false })
+  });
+
+  const $ = cheerio.load(response.data);
+  const eventCards = $('form #events .col-lg-4 .card');
+
+  console.log(`Found ${eventCards.length} cards`);
+
+  const events = [];
+  const seen = new Map();
+
+  eventCards.each((_, el) => {
+    const $card = $(el);
+
+    const eventId = $card.find('button[name="eid"]').val();
+    if (!eventId || eventId === '0') return;
+
+    const title = $card.find('.card-title span').first().text().trim();
+    if (!title) return;
+
+    const dateStr = $card.find('.fa-calendar-days').next('span').text().trim();
+    const venue =
+      $card.find('.fa-map-location-dot').next('span').text().trim() || 'TBA';
+
+    // Category (text inside parentheses)
+    let category = 'General';
+    $card.find('div').each((_, d) => {
+      const txt = $(d).text().trim();
+      if (txt.startsWith('(') && txt.endsWith(')')) {
+        category = txt.slice(1, -1);
       }
     });
-    
-    console.log(`Successfully parsed ${scrapedEvents.length} unique events`);
-    return scrapedEvents;
-    
-  } catch (error) {
-    console.error('Scraping failed:', error.message);
-    throw error;
-  }
+
+    // Participant type
+    let participantType = 'All';
+    const participantIcon = $card.find('.fa-user-check, .fa-people-carry-box');
+    if (participantIcon.length) {
+      const span = participantIcon.next('span');
+      if (span.length) participantType = span.text().trim();
+    }
+
+    // Entry fee
+    const feeStr = $card.find('.fa-indian-rupee-sign').next('span').text().trim();
+    const entryFee = parseInt(feeStr) || 0;
+
+    // TEAM SIZE
+    const teamSize = extractTeamSize($card, $);
+
+    const uniqueId = `${eventId}_${title}_${category}`;
+    if (seen.has(uniqueId)) return;
+
+    const event = {
+      id: uniqueId,
+      title,
+      event_date: parseEventDate(dateStr),
+      venue,
+      category,
+      participant_type: participantType,
+      entry_fee: entryFee,
+      team_size: String(teamSize), // FORCE STRING
+      poster_url: `https://eventhubcc.vit.ac.in/EventHub/image/?id=${eventId}`,
+      scraped_at: new Date().toISOString()
+    };
+
+    seen.set(uniqueId, true);
+    events.push(event);
+  });
+
+  console.log(`Parsed ${events.length} unique events`);
+  return events;
 }
 
-async function syncWithSupabase(scrapedEvents) {
-  console.log('Syncing with Supabase...');
-  
-  try {
-    console.log('Deleting all existing events...');
-    const { error: deleteError } = await supabase
-      .from('official_events')
-      .delete()
-      .neq('id', '');
-    
-    if (deleteError) {
-      throw new Error(`Delete failed: ${deleteError.message}`);
-    }
-    
-    console.log('All existing events deleted');
-    
-    scrapedEvents.sort((a, b) => {
-      const idA = a.id.split('_')[0];
-      const idB = b.id.split('_')[0];
-      return parseInt(idA) - parseInt(idB);
-    });
-    
-    console.log(`Inserting ${scrapedEvents.length} events in order...`);
-    const { error: insertError } = await supabase
-      .from('official_events')
-      .insert(scrapedEvents);
-    
-    if (insertError) {
-      throw new Error(`Insert failed: ${insertError.message}`);
-    }
-    
-    console.log(`Inserted ${scrapedEvents.length} events successfully`);
-    
-    saveCache(scrapedEvents);
-    
-    console.log('Sync completed!');
-    
-    return {
-      success: true,
-      totalEvents: scrapedEvents.length
-    };
-    
-  } catch (error) {
-    console.error('Sync failed:', error.message);
-    throw error;
-  }
+/* -------------------- SUPABASE SYNC -------------------- */
+
+async function syncWithSupabase(events) {
+  console.log('Clearing old records...');
+
+  const { error: delErr } = await supabase
+    .from('official_events')
+    .delete()
+    .neq('id', '');
+
+  if (delErr) throw delErr;
+
+  console.log('Inserting new records...');
+
+  const { error: insErr } = await supabase
+    .from('official_events')
+    .insert(events);
+
+  if (insErr) throw insErr;
+
+  saveCache(events);
+  console.log('Sync complete');
 }
+
+/* -------------------- MAIN -------------------- */
 
 async function main() {
-  console.log('='.repeat(50));
-  console.log('EVENTHUB SCRAPER - GitHub Actions');
-  console.log('='.repeat(50));
-  
   try {
     if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-      throw new Error('Missing Supabase credentials');
+      throw new Error('Missing Supabase env vars');
     }
-    
-    const scrapedEvents = await scrapeEventHub();
-    
-    if (scrapedEvents.length === 0) {
-      throw new Error('No events scraped - aborting sync');
-    }
-    
-    const result = await syncWithSupabase(scrapedEvents);
-    
-    console.log('='.repeat(50));
-    console.log('SCRAPE SUMMARY');
-    console.log('='.repeat(50));
-    console.log(`Status: SUCCESS`);
-    console.log(`Total Events: ${result.totalEvents}`);
-    console.log(`Completed at: ${new Date().toISOString()}`);
-    console.log('='.repeat(50));
-    
+
+    const events = await scrapeEventHub();
+    if (!events.length) throw new Error('No events scraped');
+
+    await syncWithSupabase(events);
+
+    console.log('SUCCESS');
     process.exit(0);
-    
-  } catch (error) {
-    console.error('='.repeat(50));
-    console.error('SCRAPE FAILED');
-    console.error('='.repeat(50));
-    console.error(`Error: ${error.message}`);
-    console.error(`Failed at: ${new Date().toISOString()}`);
-    console.error('='.repeat(50));
-    
+  } catch (err) {
+    console.error('FAILED:', err.message);
     process.exit(1);
   }
 }
