@@ -6,11 +6,15 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import https from 'https';
 
+/* -------------------- PATH SETUP -------------------- */
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const EVENTHUB_URL = 'https://eventhubcc.vit.ac.in/EventHub/';
 const CACHE_FILE = path.join(__dirname, 'cache', 'last-scrape.json');
+
+/* -------------------- SUPABASE -------------------- */
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -18,15 +22,6 @@ const supabase = createClient(
 );
 
 /* -------------------- CACHE -------------------- */
-
-function loadCache() {
-  try {
-    if (fs.existsSync(CACHE_FILE)) {
-      return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-    }
-  } catch {}
-  return { events: [], lastScrape: null };
-}
 
 function saveCache(events) {
   const dir = path.dirname(CACHE_FILE);
@@ -36,9 +31,8 @@ function saveCache(events) {
     CACHE_FILE,
     JSON.stringify(
       {
-        lastScrape: new Date().toISOString(),
-        totalEvents: events.length,
-        events
+        scraped_at: new Date().toISOString(),
+        total_events: events.length
       },
       null,
       2
@@ -49,19 +43,15 @@ function saveCache(events) {
 /* -------------------- HELPERS -------------------- */
 
 function parseEventDate(dateStr) {
-  try {
-    return new Date(dateStr).toISOString();
-  } catch {
-    return new Date().toISOString();
-  }
+  const d = new Date(dateStr);
+  return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
 }
 
 function extractTeamSize($card, $) {
-  let teamSize = '1'; // default
+  let teamSize = '1';
 
   $card.find('i').each((_, icon) => {
     const cls = $(icon).attr('class') || '';
-
     if (
       cls.includes('fa-users') ||
       cls.includes('fa-user') ||
@@ -86,24 +76,22 @@ async function scrapeEventHub() {
 
   const response = await axios.get(EVENTHUB_URL, {
     timeout: 30000,
-    headers: {
-      'User-Agent': 'Mozilla/5.0'
-    },
+    headers: { 'User-Agent': 'Mozilla/5.0' },
     httpsAgent: new https.Agent({ rejectUnauthorized: false })
   });
 
   const $ = cheerio.load(response.data);
-  const eventCards = $('form #events .col-lg-4 .card');
+  const cards = $('form #events .col-lg-4 .card');
 
-  console.log(`Found ${eventCards.length} cards`);
+  console.log(`Found ${cards.length} cards`);
 
   const events = [];
-  const seen = new Map();
+  const seen = new Set();
 
-  eventCards.each((_, el) => {
+  cards.each((_, el) => {
     const $card = $(el);
 
-    const eventId = $card.find('button[name="eid"]').val();
+    const eventId = $card.find('button[name="eid"]').attr('value');
     if (!eventId || eventId === '0') return;
 
     const title = $card.find('.card-title span').first().text().trim();
@@ -113,7 +101,6 @@ async function scrapeEventHub() {
     const venue =
       $card.find('.fa-map-location-dot').next('span').text().trim() || 'TBA';
 
-    // Category (text inside parentheses)
     let category = 'General';
     $card.find('div').each((_, d) => {
       const txt = $(d).text().trim();
@@ -122,25 +109,23 @@ async function scrapeEventHub() {
       }
     });
 
-    // Participant type
     let participantType = 'All';
-    const participantIcon = $card.find('.fa-user-check, .fa-people-carry-box');
-    if (participantIcon.length) {
-      const span = participantIcon.next('span');
+    const pIcon = $card.find('.fa-user-check, .fa-people-carry-box');
+    if (pIcon.length) {
+      const span = pIcon.next('span');
       if (span.length) participantType = span.text().trim();
     }
 
-    // Entry fee
-    const feeStr = $card.find('.fa-indian-rupee-sign').next('span').text().trim();
-    const entryFee = parseInt(feeStr) || 0;
+    const feeText = $card.find('.fa-indian-rupee-sign').next('span').text().trim();
+    const entryFee = feeText.toLowerCase() === 'free' ? 0 : parseInt(feeText) || 0;
 
-    // TEAM SIZE
     const teamSize = extractTeamSize($card, $);
 
     const uniqueId = `${eventId}_${title}_${category}`;
     if (seen.has(uniqueId)) return;
+    seen.add(uniqueId);
 
-    const event = {
+    events.push({
       id: uniqueId,
       title,
       event_date: parseEventDate(dateStr),
@@ -148,13 +133,11 @@ async function scrapeEventHub() {
       category,
       participant_type: participantType,
       entry_fee: entryFee,
-      team_size: String(teamSize), // FORCE STRING
+      team_size: String(teamSize),
       poster_url: `https://eventhubcc.vit.ac.in/EventHub/image/?id=${eventId}`,
-      scraped_at: new Date().toISOString()
-    };
-
-    seen.set(uniqueId, true);
-    events.push(event);
+      scraped_at: new Date().toISOString(),
+      is_active: true
+    });
   });
 
   console.log(`Parsed ${events.length} unique events`);
@@ -190,14 +173,15 @@ async function syncWithSupabase(events) {
 async function main() {
   try {
     if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-      throw new Error('Missing Supabase env vars');
+      throw new Error('Missing Supabase environment variables');
     }
 
     const events = await scrapeEventHub();
-    if (!events.length) throw new Error('No events scraped');
+    if (!events.length) {
+      throw new Error('No events scraped');
+    }
 
     await syncWithSupabase(events);
-
     console.log('SUCCESS');
     process.exit(0);
   } catch (err) {
