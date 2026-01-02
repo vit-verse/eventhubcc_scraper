@@ -1,50 +1,51 @@
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import https from 'https';
+import sharp from 'sharp';
 
-/* -------------------- PATH SETUP -------------------- */
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+/* ===================== CONSTANTS ===================== */
 
 const EVENTHUB_URL = 'https://eventhubcc.vit.ac.in/EventHub/';
-const CACHE_FILE = path.join(__dirname, 'cache', 'last-scrape.json');
+const POSTER_BASE = 'https://eventhubcc.vit.ac.in/EventHub/image/?id=';
 
-/* -------------------- SUPABASE -------------------- */
+const BUCKET = 'eventhub-posters';
+const BASE_FOLDER = 'eventhub';
+
+const MAX_IMAGE_SIZE = 1024 * 1024; // 1 MB strict
+
+/* ===================== SUPABASE ===================== */
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_KEY
 );
 
-/* -------------------- CACHE -------------------- */
+/* ===================== HELPERS ===================== */
 
-function saveCache(events) {
-  const dir = path.dirname(CACHE_FILE);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-
-  fs.writeFileSync(
-    CACHE_FILE,
-    JSON.stringify(
-      {
-        scraped_at: new Date().toISOString(),
-        total_events: events.length
-      },
-      null,
-      2
-    )
-  );
-}
-
-/* -------------------- HELPERS -------------------- */
+const slugify = (str) =>
+  str
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/(^-|-$)/g, '');
 
 function parseEventDate(dateStr) {
   const d = new Date(dateStr);
-  return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/**
+ * Only allow today or future events
+ */
+function isUpcomingOrOngoing(dateStr) {
+  const eventDate = new Date(dateStr);
+  if (isNaN(eventDate.getTime())) return false;
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  eventDate.setHours(0, 0, 0, 0);
+
+  return eventDate >= today;
 }
 
 function extractTeamSize($card, $) {
@@ -52,30 +53,97 @@ function extractTeamSize($card, $) {
 
   $card.find('i').each((_, icon) => {
     const cls = $(icon).attr('class') || '';
-    if (
-      cls.includes('fa-users') ||
-      cls.includes('fa-user') ||
-      cls.includes('fa-street-view') ||
-      cls.includes('fa-people')
-    ) {
+    if (cls.includes('fa-user')) {
       const text = $(icon).parent().text();
       const match = text.match(/\b\d+\s*-\s*\d+\b|\b\d+\b/);
-      if (match) {
-        teamSize = match[0].replace(/\s+/g, '');
-      }
+      if (match) teamSize = match[0].replace(/\s+/g, '');
     }
   });
 
   return teamSize;
 }
 
-/* -------------------- SCRAPER -------------------- */
+/* ===================== IMAGE COMPRESSION ===================== */
+
+async function compressImageStrict(buffer) {
+  let quality = 80;
+
+  while (quality >= 30) {
+    const output = await sharp(buffer)
+      .resize({ width: 1024, withoutEnlargement: true })
+      .webp({ quality })
+      .toBuffer();
+
+    if (output.length < MAX_IMAGE_SIZE) {
+      return output;
+    }
+
+    quality -= 10;
+  }
+
+  throw new Error('Poster cannot be compressed below 1MB');
+}
+
+/* ===================== POSTER UPLOAD ===================== */
+
+async function uploadPoster(eventhubId, variantKey) {
+  const srcUrl = `${POSTER_BASE}${eventhubId}`;
+
+  const res = await axios.get(srcUrl, {
+    responseType: 'arraybuffer',
+    httpsAgent: new https.Agent({ rejectUnauthorized: false })
+  });
+
+  const compressed = await compressImageStrict(res.data);
+
+  const filePath = `${BASE_FOLDER}/${eventhubId}/${variantKey}.webp`;
+
+  const { error } = await supabase.storage
+    .from(BUCKET)
+    .upload(filePath, compressed, {
+      contentType: 'image/webp',
+      upsert: true
+    });
+
+  if (error) throw error;
+
+  const { data } = supabase.storage
+    .from(BUCKET)
+    .getPublicUrl(filePath);
+
+  return data.publicUrl;
+}
+
+/* ===================== STORAGE CLEANUP ===================== */
+
+async function clearEventHubPosters() {
+  const { data: folders, error } = await supabase.storage
+    .from(BUCKET)
+    .list(BASE_FOLDER);
+
+  if (error || !folders?.length) return;
+
+  const paths = [];
+
+  for (const folder of folders) {
+    const { data: files } = await supabase.storage
+      .from(BUCKET)
+      .list(`${BASE_FOLDER}/${folder.name}`);
+
+    files?.forEach(f =>
+      paths.push(`${BASE_FOLDER}/${folder.name}/${f.name}`)
+    );
+  }
+
+  if (paths.length) {
+    await supabase.storage.from(BUCKET).remove(paths);
+  }
+}
+
+/* ===================== SCRAPER ===================== */
 
 async function scrapeEventHub() {
-  console.log('Fetching EventHub...');
-
   const response = await axios.get(EVENTHUB_URL, {
-    timeout: 30000,
     headers: { 'User-Agent': 'Mozilla/5.0' },
     httpsAgent: new https.Agent({ rejectUnauthorized: false })
   });
@@ -83,111 +151,95 @@ async function scrapeEventHub() {
   const $ = cheerio.load(response.data);
   const cards = $('form #events .col-lg-4 .card');
 
-  console.log(`Found ${cards.length} cards`);
-
   const events = [];
-  const seen = new Set();
 
-  cards.each((_, el) => {
+  for (const el of cards) {
     const $card = $(el);
 
-    const eventId = $card.find('button[name="eid"]').attr('value');
-    if (!eventId || eventId === '0') return;
+    const eventhubId = $card.find('button[name="eid"]').attr('value');
+    if (!eventhubId || eventhubId === '0') continue;
 
     const title = $card.find('.card-title span').first().text().trim();
-    if (!title) return;
+    if (!title) continue;
 
     const dateStr = $card.find('.fa-calendar-days').next('span').text().trim();
+
+    // HARD FILTER: skip past events completely
+    if (!isUpcomingOrOngoing(dateStr)) continue;
+
     const venue =
       $card.find('.fa-map-location-dot').next('span').text().trim() || 'TBA';
 
     let category = 'General';
     $card.find('div').each((_, d) => {
-      const txt = $(d).text().trim();
-      if (txt.startsWith('(') && txt.endsWith(')')) {
-        category = txt.slice(1, -1);
-      }
+      const t = $(d).text().trim();
+      if (t.startsWith('(') && t.endsWith(')')) category = t.slice(1, -1);
     });
 
     let participantType = 'All';
-    const pIcon = $card.find('.fa-user-check, .fa-people-carry-box');
-    if (pIcon.length) {
-      const span = pIcon.next('span');
-      if (span.length) participantType = span.text().trim();
-    }
+    const p = $card.find('.fa-user-check, .fa-people-carry-box').next('span');
+    if (p.length) participantType = p.text().trim();
 
     const feeText = $card.find('.fa-indian-rupee-sign').next('span').text().trim();
-    const entryFee = feeText.toLowerCase() === 'free' ? 0 : parseInt(feeText) || 0;
+    const entryFee =
+      feeText.toLowerCase() === 'free' ? 0 : parseInt(feeText) || 0;
 
     const teamSize = extractTeamSize($card, $);
 
-    const uniqueId = `${eventId}_${title}_${category}`;
-    if (seen.has(uniqueId)) return;
-    seen.add(uniqueId);
+    const variantKey = slugify(`${category}|${participantType}|${entryFee}`);
+    const eventId = `official:${eventhubId}:${variantKey}`;
+
+    // Poster upload ONLY after date filter
+    const poster_url = await uploadPoster(eventhubId, variantKey);
 
     events.push({
-      id: uniqueId,
+      id: eventId,
       title,
       event_date: parseEventDate(dateStr),
       venue,
       category,
       participant_type: participantType,
       entry_fee: entryFee,
-      team_size: String(teamSize),
-      poster_url: `https://eventhubcc.vit.ac.in/EventHub/image/?id=${eventId}`,
-      scraped_at: new Date().toISOString(),
+      team_size: teamSize,
+      poster_url,
       is_active: true
     });
-  });
+  }
 
-  console.log(`Parsed ${events.length} unique events`);
   return events;
 }
 
-/* -------------------- SUPABASE SYNC -------------------- */
+/* ===================== SYNC ===================== */
 
-async function syncWithSupabase(events) {
-  console.log('Clearing old records...');
+async function sync(events) {
+  await clearEventHubPosters();
 
-  const { error: delErr } = await supabase
+  await supabase
     .from('official_events')
     .delete()
     .neq('id', '');
 
-  if (delErr) throw delErr;
-
-  console.log('Inserting new records...');
-
-  const { error: insErr } = await supabase
+  const { error } = await supabase
     .from('official_events')
     .insert(events);
 
-  if (insErr) throw insErr;
-
-  saveCache(events);
-  console.log('Sync complete');
+  if (error) throw error;
 }
 
-/* -------------------- MAIN -------------------- */
+/* ===================== MAIN ===================== */
 
-async function main() {
+(async () => {
   try {
-    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
-      throw new Error('Missing Supabase environment variables');
-    }
-
     const events = await scrapeEventHub();
     if (!events.length) {
-      throw new Error('No events scraped');
+      console.log('No upcoming events found');
+      return;
     }
 
-    await syncWithSupabase(events);
+    await sync(events);
     console.log('SUCCESS');
-    process.exit(0);
   } catch (err) {
     console.error('FAILED:', err.message);
     process.exit(1);
   }
-}
-
-main();
+})();
